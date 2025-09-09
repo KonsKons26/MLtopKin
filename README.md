@@ -20,3 +20,6 @@ This project was a two person assignment. We chose to train a classical Machine 
 ### Features
 - Run the [2_prep_ml_data](notebooks/2_prep_ml_data.ipynb) notebook to generate the topological and geometric features.
 - Then run the [3_eda](notebooks/3_eda.ipynb) notebook to perform a rudimentary Exploratory Data Analysis.
+
+### Repeated Nested Cross Validation
+- Run the [4_nestedCV.ipynb](notebooks/4_nestedCV.ipynb) notebook to run the repeated nested cross validation pipeline.
