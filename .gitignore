@@ -1,2 +1,4 @@
 .venv
 latex_files
+data_raw
+data
