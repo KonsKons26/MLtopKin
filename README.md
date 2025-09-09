@@ -3,7 +3,7 @@
 ## Scope
 This project was a two person assignment. We chose to train a classical Machine Learning model to classify kinase structures to active or inactive conformations, using no information other than the structure itself, unlike previous methods. To that end we generated geometric and topological features from the kinase structures and used those for training and predicting.
 
-## Pipeline
+## Recreation Pipeline
 ### Python environment
 - `python3 -m venv .venv`
 - `source .venv/bin/activate`
@@ -16,3 +16,6 @@ This project was a two person assignment. We chose to train a classical Machine 
 - Download manually any files that failed for some reason.
 - Run the second part of the [1_download_clean_pdbs.ipynb](notebooks/1_download_clean_pdbs.ipynb) notebook (__2. Clean pdbs__).
 - Run `grep "ERROR" logs/create_pdbs.log` to inspect for issues. If only a few files failed we can ignore them, we will have enough data.
+
+### Feature
+- Run the [2_prep_ml_data](notebooks/2_prep_ml_data.ipynb) notebook to generate the topological and geometric features.
