@@ -17,5 +17,6 @@ This project was a two person assignment. We chose to train a classical Machine 
 - Run the second part of the [1_download_clean_pdbs.ipynb](notebooks/1_download_clean_pdbs.ipynb) notebook (__2. Clean pdbs__).
 - Run `grep "ERROR" logs/create_pdbs.log` to inspect for issues. If only a few files failed we can ignore them, we will have enough data.
 
-### Feature
+### Features
 - Run the [2_prep_ml_data](notebooks/2_prep_ml_data.ipynb) notebook to generate the topological and geometric features.
+- Then run the [3_eda](notebooks/3_eda.ipynb) notebook to perform a rudimentary Exploratory Data Analysis.

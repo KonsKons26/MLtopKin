@@ -2,3 +2,4 @@
 latex_files
 data_raw
 data
+src/__pycache__
