@@ -24,3 +24,4 @@ This project was a two person assignment. We chose to train a classical Machine 
 ### Model training
 - Run the [4_baselines](notebooks/4_baselines.ipynb) notebook to run a simple train/test on all models.
 - Run the [5_nestedCV](notebooks/5_nestedCV.ipynb) notebook to run the repeated nested cross validation pipeline, on the 3 best models found in the __baselines__ steps.
+- Run the [6_tuning_RF](notebooks/6_tuning_RF.ipynb) notebook to train the final Random Forest model.
