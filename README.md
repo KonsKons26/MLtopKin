@@ -1,4 +1,4 @@
-# Final project for the 'Algorithms in Structural Bioinformatics'
+# Final project for the course 'Algorithms in Structural Bioinformatics'
 
 ## Scope
 
