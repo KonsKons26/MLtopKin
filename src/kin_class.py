@@ -1,5 +1,7 @@
 import numpy as np
-from Bio.PDB import PDBParser
+from Bio.PDB import PDBParser, MMCIFParser
+from Bio.PDB.Polypeptide import is_aa
+from Bio.Data.PDBData import protein_letters_3to1_extended
 from Bio.SeqUtils import molecular_weight
 import freesasa as fs
 import gudhi as gd
@@ -16,14 +18,16 @@ class Kinase:
             chain: str,
             group: str = None,
             gene: str = None,
+            domain: tuple = None,
             C_alpha_only: bool = False,
             remove_HETATM: bool = True,
             remove_hydrogens: bool = True,
-            alpha_square: int = 20,
+            alpha_square: float = np.inf,
             max_dim: int = 2,
             pixel_size: float = 1.0,
             birth_range: tuple = (0, 10),
-            pers_range: tuple = (0, 10)
+            pers_range: tuple = (0, 10),
+            normalize: bool = True
         ):
         self.pdb_file = pdb_file
         self.name = name
@@ -32,6 +36,7 @@ class Kinase:
         self.chain = chain
         self.group = group
         self.gene = gene
+        self.domain = domain
         self.C_alpha_only = C_alpha_only
         self.remove_HETATM = remove_HETATM
         self.remove_hydrogens = remove_hydrogens
@@ -40,6 +45,7 @@ class Kinase:
         self.pixel_size = pixel_size
         self.birth_range = birth_range
         self.pers_range = pers_range
+        self.normalize = normalize
 
         # Initialize attributes
         self.persistence_diagrams = None
@@ -52,72 +58,114 @@ class Kinase:
 
     def _parse_pdb(self):
         """
-        Parses the PDB file to extract coordinates and calculate molecular
-        weight. If C_alpha_only is True, only C_alpha atoms are selected. If
-        remove_HETATM is True, HETATM residues are skipped. If remove_hydrogens
-        is True, hydrogen atoms are skipped (not applicable if C_alpha_only is
-        True).
+        Parses the PDB/mmCIF file to extract coordinates and calculate
+        molecular weight. Only the first model is used. If C_alpha_only is
+        True, only C_alpha atoms are selected. If remove_HETATM is True,
+        HETATM residues are skipped, except modified amino acids. If domain is
+        given, only residues numbered within (start, end) are kept. If
+        remove_hydrogens is True, hydrogen atoms are skipped (not applicable
+        if C_alpha_only is True).
         """
-        parser = PDBParser(QUIET=True)
-        try:
-            structure = parser.get_structure("PDB", self.pdb_file)
-        except Exception as e:
-            print(f"File {self.pdb_file} could not be parsed with exception:")
-            print(e)
-            print("Exiting...")
-            return None
+        if self.pdb_file.endswith(".cif"):
+            parser = MMCIFParser(QUIET=True)
+        else:
+            parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("PDB", self.pdb_file)
         coordinates = []
+        sasa_atoms = []
         seq = ""
+        n_residues = 0
 
-        for model in structure:
-            for chain in model:
-                if chain.id != self.chain:
+        # Only the first model (NMR/EM files can hold many models)
+        for chain in structure[0]:
+            if chain.id != self.chain:
+                continue
+
+            for residue in chain:
+                # Skip HETATM (ligands, waters, ions) but keep modified
+                # amino acids such as phosphorylated residues
+                if (
+                    self.remove_HETATM
+                    and residue.id[0] != " "
+                    and not is_aa(residue)
+                ):
                     continue
 
-                for residue in chain:
-                    # Skip HETATM
-                    if self.remove_HETATM and residue.id[0] != " ":
-                        continue
+                # Keep only the kinase domain if its boundaries are given
+                if self.domain is not None and not (
+                    self.domain[0] <= residue.id[1] <= self.domain[1]
+                ):
+                    continue
 
-                    # Select C_alpha only
-                    if self.C_alpha_only and residue.has_id("CA"):
-                        coordinates.append(residue["CA"].get_coord())
-                        seq += "C"
+                resname = residue.get_resname()
+                n_residues += 1
 
-                    # Select all atoms
-                    elif not self.C_alpha_only:
+                # Heavy atoms of the selected residues, used for the SASA
+                for atom in residue:
+                    if atom.element != "H":
+                        # PDB style 4 character atom name, which FreeSASA
+                        # needs to look up the atomic radius
+                        name = atom.get_name()
+                        if len(atom.element) == 1:
+                            name = " " + name
+                        sasa_atoms.append((
+                            name.ljust(4), resname, str(residue.id[1]),
+                            chain.id, *(float(c) for c in atom.get_coord())
+                        ))
+
+                # Select C_alpha only
+                if self.C_alpha_only and residue.has_id("CA"):
+                    coordinates.append(residue["CA"].get_coord())
+                    seq += "C"
+
+                # Select all atoms
+                elif not self.C_alpha_only:
+                    # One letter per residue (modified residues are mapped
+                    # to their parent amino acid)
+                    seq += protein_letters_3to1_extended.get(resname, "")
+                    for atom in residue:
                         # Skip hydrogens
-                        if self.remove_hydrogens:
-                            for atom in residue:
-                                if atom.element != "H":
-                                    coordinates.append(atom.get_coord())
-                                    seq += residue.get_resname()
-
-                        else:
-                            for atom in residue:
-                                coordinates.append(atom.get_coord())
-                                seq += residue.get_resname()
+                        if self.remove_hydrogens and atom.element == "H":
+                            continue
+                        coordinates.append(atom.get_coord())
 
         if len(coordinates) == 0:
             raise ValueError(
                 f"No valid atoms found for {self.pdb_file}"
             )
 
+        # A domain that is mostly missing means that the residue numbers of
+        # the file do not match the given domain boundaries
+        if self.domain is not None:
+            domain_length = self.domain[1] - self.domain[0] + 1
+            if n_residues < 0.5 * domain_length:
+                raise ValueError(
+                    f"Only {n_residues} of the {domain_length} domain "
+                    f"residues found for {self.pdb_file}"
+                )
+
         # Calculate molecular weight
         if not self.C_alpha_only:
-            self.seq = seq 
+            self.seq = seq
             self.mw = molecular_weight(seq, seq_type="protein")
         else:
             self.seq = None
             self.mw = len(seq) * 12.0107
+        self._sasa_atoms = sasa_atoms
         self.coordinates = np.array(coordinates)
 
     def _compute_sasa(self):
         """
-        Computes the Solvent Accessible Surface Area (SASA) of the kinase
-        structure.
+        Computes the Solvent Accessible Surface Area (SASA) of the selected
+        residues (all heavy atoms).
         """
-        structure = fs.Structure(self.pdb_file)
+        # Radii of atoms unknown to FreeSASA (modified residues) are guessed
+        # from the element, do not print a warning for each of them
+        fs.setVerbosity(fs.nowarnings)
+        structure = fs.Structure()
+        for atom in self._sasa_atoms:
+            structure.addAtom(*atom)
+        del self._sasa_atoms
         sasa = fs.calc(structure).totalArea()
         normalized_sasa = sasa / self.mw
         self.sasa = sasa
@@ -126,115 +174,64 @@ class Kinase:
     def _compute_persistence(self):
         """
         Computes the persistent homology using Alpha complex from GUDHI.
+        Filtration values are squared radii.
         """
-        try:
-            # Create Alpha complex
-            alpha_complex = gd.AlphaComplex(points=self.coordinates)
+        # Create Alpha complex
+        alpha_complex = gd.AlphaComplex(points=self.coordinates)
 
-            # Create simplex tree
-            simplex_tree = alpha_complex.create_simplex_tree(
-                max_alpha_square=self.alpha_square
-            )
+        # Create simplex tree
+        simplex_tree = alpha_complex.create_simplex_tree(
+            max_alpha_square=self.alpha_square
+        )
 
-            # Compute persistence
-            persistence = simplex_tree.persistence(
-                homology_coeff_field=2,  # Z/2Z coefficients
-                min_persistence=0
-            )
+        # Compute persistence
+        simplex_tree.persistence(
+            homology_coeff_field=2,  # Z/2Z coefficients
+            min_persistence=0
+        )
 
-            # Store persistence diagrams by dimension
-            self.persistence_diagrams = {}
-            for dim in range(self.max_dim + 1):
-                dim_persistence = simplex_tree.persistence_intervals_in_dimension(dim)
-                if len(dim_persistence) > 0:
-                    self.persistence_diagrams[dim] = dim_persistence
-                else:
-                    # Create empty diagram if no features in this dimension
-                    self.persistence_diagrams[dim] = np.empty((0, 2))
-
-        except Exception as e:
-            print(f"Error computing persistence for {self.name}: {e}")
-            # Initialize empty diagrams
-            self.persistence_diagrams = {}
-            for dim in range(self.max_dim + 1):
+        # Store persistence diagrams by dimension
+        self.persistence_diagrams = {}
+        for dim in range(self.max_dim + 1):
+            dim_persistence = simplex_tree.persistence_intervals_in_dimension(dim)
+            if len(dim_persistence) > 0:
+                self.persistence_diagrams[dim] = dim_persistence
+            else:
+                # Create empty diagram if no features in this dimension
                 self.persistence_diagrams[dim] = np.empty((0, 2))
 
     def _compute_persistence_images(self):
         """
         Computes persistence images for each homological dimension.
         """
-        try:
-            for dim, diagram in self.persistence_diagrams.items():
-                if len(diagram) > 0:
-                    # Filter out infinite persistence points and convert to
-                    # birth-persistence format
-                    finite_diagram = []
-                    for point in diagram:
-                        birth, death = point[0], point[1]
-                        # Skip infinite persistence points
-                        if not np.isinf(death):
-                            persistence = death - birth
-                            # Only include points with positive persistence
-                            if persistence > 0:
-                                finite_diagram.append([birth, persistence])
+        for dim, diagram in self.persistence_diagrams.items():
+            # Drop infinite persistence points (with the full filtration this
+            # is only the single connected component in H0)
+            finite_diagram = diagram[np.isfinite(diagram[:, 1])]
 
-                    if len(finite_diagram) > 0:
-                        finite_diagram = np.array(finite_diagram)
+            # All H0 classes of an alpha complex are born at 0, so a single
+            # birth column is enough (1D profile of the deaths)
+            if dim == 0:
+                birth_range = (0, self.pixel_size)
+            else:
+                birth_range = self.birth_range
 
-                        # Create persistence image using the new API
-                        pim = persim.PersistenceImager(
-                            pixel_size=self.pixel_size,
-                            birth_range=self.birth_range,
-                            pers_range=self.pers_range
-                        )
-
-                        # Transform diagram to persistence image
-                        # Note: expects list of diagrams
-                        img = pim.transform([finite_diagram])
-                        # Get first (and only) image
-                        self.persistence_images[f"H{dim}"] = img[0]
-                    else:
-                        # Create zero image if no finite features
-                        pixels_x = int(
-                            (self.birth_range[1] - self.birth_range[0])
-                            / self.pixel_size
-                        )
-                        pixels_y = int(
-                            (self.pers_range[1] - self.pers_range[0])
-                            / self.pixel_size
-                        )
-                        self.persistence_images[f"H{dim}"] = np.zeros(
-                            (pixels_y, pixels_x)
-                        )
-                else:
-                    # Create zero image for empty diagrams
-                    pixels_x = int(
-                        (self.birth_range[1] - self.birth_range[0])
-                        / self.pixel_size
-                    )
-                    pixels_y = int(
-                        (self.pers_range[1] - self.pers_range[0])
-                        / self.pixel_size
-                    )
-                    self.persistence_images[f"H{dim}"] = np.zeros(
-                        (pixels_y, pixels_x)
-                    )
-
-        except Exception as e:
-            print(f"Error computing persistence images for {self.name}: {e}")
-            # Initialize empty images
-            pixels_x = int(
-                (self.birth_range[1] - self.birth_range[0])
-                / self.pixel_size
+            pim = persim.PersistenceImager(
+                pixel_size=self.pixel_size,
+                birth_range=birth_range,
+                pers_range=self.pers_range
             )
-            pixels_y = int(
-                (self.pers_range[1] - self.pers_range[0])
-                / self.pixel_size
-            )
-            for dim in range(self.max_dim + 1):
-                self.persistence_images[f"H{dim}"] = np.zeros(
-                    (pixels_y, pixels_x)
-                )
+
+            # Note: expects a list of diagrams in birth-death coordinates
+            # (skew=True converts them to birth-persistence)
+            img = pim.transform([finite_diagram], skew=True)[0]
+
+            # Images are sums over all points, so divide by the number of
+            # points to remove the dependence on the size of the structure
+            if self.normalize:
+                img = img / len(self.coordinates)
+
+            self.persistence_images[f"H{dim}"] = img
 
     def get_feature_vector(self, flatten=True, include_dims=None):
         """

@@ -1,9 +1,10 @@
 import os
+import re
 from pathlib import Path
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from src.kin_class import Kinase
 
 
@@ -13,6 +14,7 @@ def prep_kinase_data_list(
         gene_col="Gene",
         group_col="Gene_Group",
         pdb_col="PDB",
+        domain_col=None,
         validate_files=True
     ):
     """
@@ -37,20 +39,26 @@ def prep_kinase_data_list(
         Root directory containing gene/activity subdirectories with PDB files
     df : pandas.DataFrame
         DataFrame containing metadata with columns for genes, gene
-        groups/families, and PDB IDs
+        groups/families, and PDB IDs. Files of chains that are not in this
+        DataFrame are skipped, so pass the table of the selected chains
     gene_col : str, default "Gene"
         Column name in df containing individual gene names
     group_col : str, default "Gene_Group"
         Column name in df containing gene group/family information
     pdb_col : str, default "PDB"
         Column name in df containing PDB IDs (should match filename patterns)
+    domain_col : str, default None
+        Column name in df containing the kinase domain boundaries as
+        "start-end" residue numbers (e.g. "DomainBoundary"). If given, the
+        boundaries are passed on so that only the kinase domain is used
     validate_files : bool, default True
         Whether to validate that PDB files exist and are readable
 
     Returns:
     --------
     list of dict
-        Each dict contains: pdb_file, name, activity, pdb_id, chain, gene, group
+        Each dict contains: pdb_file, name, activity, pdb_id, chain, gene,
+        group, domain
     """
 
     kinase_data_list = []
@@ -73,11 +81,16 @@ def prep_kinase_data_list(
         'skipped_no_activity': 0,
         'skipped_parse_error': 0,
         'skipped_not_in_df': 0,
+        'skipped_duplicate': 0,
         'skipped_file_error': 0
     }
 
     # Walk through directory structure
-    for pdb_file in base_path.rglob("*.pdb"):
+    seen_names = set()
+    structure_files = sorted(
+        f for f in base_path.rglob("*") if f.suffix in (".pdb", ".cif")
+    )
+    for pdb_file in structure_files:
         stats['total_files'] += 1
 
         try:
@@ -139,11 +152,22 @@ def prep_kinase_data_list(
             # Find matching row in DataFrame
             gene_name = None
             group = None
+            domain = None
             for key in lookup_keys:
                 matching_rows = df[df[pdb_col] == key]
                 if not matching_rows.empty:
                     gene_name = matching_rows[gene_col].iloc[0]
                     group = matching_rows[group_col].iloc[0]
+                    if domain_col is not None:
+                        boundaries = re.fullmatch(
+                            r"(-?\d+)-(-?\d+)",
+                            str(matching_rows[domain_col].iloc[0])
+                        )
+                        if boundaries:
+                            domain = (
+                                int(boundaries.group(1)),
+                                int(boundaries.group(2))
+                            )
                     break
 
             if gene_name is None or group is None:
@@ -154,6 +178,14 @@ def prep_kinase_data_list(
                 )
                 stats['skipped_not_in_df'] += 1
                 continue
+
+            # Keep one record per chain (e.g. same chain as .cif and .pdb)
+            name = f"{gene}_{pdb_id_base}_{chain}"
+            if name in seen_names:
+                print(f"Warning: Duplicate of {name}. Skipping {pdb_file}")
+                stats['skipped_duplicate'] += 1
+                continue
+            seen_names.add(name)
 
             # Validate file if requested
             if validate_files:
@@ -172,12 +204,13 @@ def prep_kinase_data_list(
             # Create kinase data entry
             kinase_entry = {
                 'pdb_file': str(pdb_file),
-                'name': f"{gene}_{pdb_id_base}_{chain}",
+                'name': name,
                 'activity': activity.lower(),
                 'pdb_id': pdb_id_base,
                 'chain': chain,
                 'gene': gene_name,    # Individual gene name from DataFrame
-                'group': group        # Gene group/family from DataFrame
+                'group': group,       # Gene group/family from DataFrame
+                'domain': domain      # (start, end) of the kinase domain
             }
 
             kinase_data_list.append(kinase_entry)
@@ -196,6 +229,7 @@ def prep_kinase_data_list(
     print(f"Skipped - invalid activity label: {stats['skipped_no_activity']}")
     print(f"Skipped - parsing errors: {stats['skipped_parse_error']}")
     print(f"Skipped - not found in DataFrame: {stats['skipped_not_in_df']}")
+    print(f"Skipped - duplicates: {stats['skipped_duplicate']}")
     print(f"Skipped - file access errors: {stats['skipped_file_error']}")
 
     # Activity distribution
@@ -212,54 +246,54 @@ def prep_kinase_data_list(
     return kinase_data_list
 
 
+def _create_single_kinase(data, kwargs):
+    """Helper function to create a single kinase with error handling."""
+    try:
+        return Kinase(**data, **kwargs)
+    except Exception as e:
+        print(
+            f"Failed to create kinase for {data.get('name', 'unknown')}: {e}"
+        )
+        return None
+
+
 def create_kinase_dataset(kinase_data_list, max_workers=None, **kwargs):
     """
     Creates a dataset of Kinase objects from a list of kinase data using
-    parallel processing.
+    parallel processing. Structures that fail are reported and dropped.
 
     Parameters:
     -----------
     kinase_data_list : list of dict
         Each dict should contain: pdb_file, name, activity, pdb_id, chain
     max_workers : int, optional
-        Maximum number of worker threads. If None, uses default from
-        ThreadPoolExecutor
+        Maximum number of worker processes. If None, uses default from
+        ProcessPoolExecutor
     **kwargs : additional parameters to pass to Kinase constructor
 
     Returns:
     --------
-    list of Kinase objects
+    list of Kinase objects, in the order of kinase_data_list
     """
 
-    def create_single_kinase(data):
-        """Helper function to create a single kinase with error handling."""
-        try:
-            return Kinase(**data, **kwargs)
-        except Exception as e:
-            print(
-                f"Failed to create kinase for {data.get('name', 'unknown')}: {e}"
-            )
-            return None
+    kinases = [None] * len(kinase_data_list)
 
-    kinases = []
-
-    # Use ThreadPoolExecutor for parallel processing
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Use ProcessPoolExecutor for parallel processing (CPU-bound work)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
-        future_to_data = {
-            executor.submit(create_single_kinase, data): data 
-            for data in kinase_data_list
+        future_to_index = {
+            executor.submit(_create_single_kinase, data, kwargs): i
+            for i, data in enumerate(kinase_data_list)
         }
 
         # Process completed tasks with progress bar
-        for future in tqdm(as_completed(future_to_data), 
-                          total=len(kinase_data_list), 
+        for future in tqdm(as_completed(future_to_index),
+                          total=len(kinase_data_list),
                           desc="Processing kinases"):
-            kinase = future.result()
-            if kinase is not None:
-                kinases.append(kinase)
+            # Keep the input order, so that the dataset is reproducible
+            kinases[future_to_index[future]] = future.result()
 
-    return kinases
+    return [kinase for kinase in kinases if kinase is not None]
 
 
 def extract_features_for_ml(kinases, include_dims=[0, 1]):

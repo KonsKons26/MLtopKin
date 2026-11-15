@@ -10,8 +10,10 @@ from datetime import datetime
 
 import json
 
+import joblib
+
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from sklearn.metrics import (
     matthews_corrcoef, accuracy_score, balanced_accuracy_score, precision_score,
     recall_score, f1_score, roc_auc_score, confusion_matrix
@@ -90,11 +92,17 @@ class NestedCV:
         keys in VALID_METRICS.
     mrmr : bool, optional (default=True)
         Whether to use mrmr for feature selection
-    n_features : in, optional (default=10)
-        Number of features to select
+    n_features : int, optional (default=None)
+        Maximum number of features to select with mrmr. The number of
+        features actually used (up to this maximum) is tuned together with
+        the hyperparameters.
     random_state_base : int, optional (default=42)
         Base random state for reproducibility. This will be used to generate
         different random states for each fold.
+    groups : pd.Series, optional (default=None)
+        Group label of each sample (e.g. the gene). If given, samples of the
+        same group are never split between training and validation folds
+        (StratifiedGroupKFold), which avoids leakage between related samples.
     """
 
     def __init__(
@@ -112,7 +120,8 @@ class NestedCV:
             optuna_direction: str = "maximize",
             mrmr: bool = True,
             n_features: int =None,
-            random_state_base: int = 42
+            random_state_base: int = 42,
+            groups: pd.Series = None
         ):
         """Initialize the NestedCV class."""
         self.model_name = model_name
@@ -131,6 +140,7 @@ class NestedCV:
         self.mrmr = mrmr
         self.n_features = n_features
         self.random_state_base = random_state_base
+        self.groups = groups
 
         self.hyperparam_spaces = self._define_hyperparameter_spaces()
         self.results = {
@@ -183,7 +193,7 @@ class NestedCV:
                 )
             },
             "SVC": lambda trial: {
-                "C": trial.suggest_float("C", 0.1, 1, log=True),
+                "C": trial.suggest_float("C", 1e-2, 1e3, log=True),
                 "gamma": trial.suggest_categorical("gamma", ["scale", "auto"]),
                 "coef0": trial.suggest_float("coef0", 0.0, 1.0),
                 "kernel": trial.suggest_categorical(
@@ -197,7 +207,7 @@ class NestedCV:
                 )
             },
             "RandomForestClassifier": lambda trial: {
-                "n_estimators": trial.suggest_int("n_estimators", 10, 100),
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500),
                 "criterion": trial.suggest_categorical(
                     "criterion", ["gini", "entropy"]
                 ),
@@ -205,7 +215,8 @@ class NestedCV:
                 "min_samples_split": trial.suggest_int(
                     "min_samples_split", 2, 20
                 ),
-                "random_state": 42
+                "random_state": 42,
+                "n_jobs": -1
             },
             "LGBMClassifier": lambda trial: {
                 "boosting_type": trial.suggest_categorical(
@@ -214,9 +225,9 @@ class NestedCV:
                 "num_leaves": trial.suggest_int("num_leaves", 10, 100),
                 "max_depth": trial.suggest_int("max_depth", 1, 100),
                 "learning_rate": trial.suggest_float(
-                    "learning_rate", 1e-5, 1.0, log=True
+                    "learning_rate", 1e-3, 0.3, log=True
                 ),
-                "n_estimators": trial.suggest_int("n_estimators", 10, 1_000),
+                "n_estimators": trial.suggest_int("n_estimators", 50, 1_000),
                 "objective": "binary",
                 "min_child_samples": trial.suggest_int(
                     "min_child_samples", 1, 100
@@ -225,6 +236,7 @@ class NestedCV:
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
                 "verbose": -1,
                 "random_state": 42,
+                "n_jobs": -1,
                 # For rf
                 "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
                 "bagging_fraction": trial.suggest_float(
@@ -240,7 +252,8 @@ class NestedCV:
     def _calculate_metrics(
             self,
             y_true: pd.Series,
-            y_pred: pd.Series
+            y_pred: pd.Series,
+            y_score: np.ndarray
         ):
         return {
             "mcc": matthews_corrcoef(y_true, y_pred),
@@ -249,53 +262,65 @@ class NestedCV:
             "precision": precision_score(y_true, y_pred, zero_division=0),
             "recall": recall_score(y_true, y_pred, zero_division=0),
             "f1": f1_score(y_true, y_pred, zero_division=0),
-            "roc_auc": roc_auc_score(y_true, y_pred),
+            "roc_auc": roc_auc_score(y_true, y_score),
             "specificity": specificity_score(y_true, y_pred)
         }
 
 
-    def _objective(
-            self,
-            trial: optuna.Trial,
-            X_train: pd.DataFrame,
-            y_train: pd.Series,
-            objective_random_state: int
-        ):
+    def _make_cv(self, n_splits: int, random_state: int):
         """
-        Objective function for Optuna hyperparameter optimization.
-
-        Parameters
-        ----------
-        trial : optuna.Trial
-            The Optuna trial object.
-        X_train : pd.DataFrame
-            Training features.
-        y_train : pd.Series
-            Training target variable.
-        objective_random_state : int
-            Random state for reproducibility within this objective's inner
-            folds.
-
-        Returns
-        -------
-        float
-            The mean score of the model based on the specified metric.
+        Stratified K-fold splitter. Keeps the groups together if groups were
+        given.
         """
-        hyperparams = self.hyperparam_spaces[self.model_name](trial)
-        model = VALID_MODELS[self.model_name].__class__(**hyperparams)
-
-        skf = StratifiedKFold(
-            n_splits=self.n_inners,
-            shuffle=True,
-            random_state=objective_random_state
+        if self.groups is not None:
+            return StratifiedGroupKFold(
+                n_splits=n_splits, shuffle=True, random_state=random_state
+            )
+        return StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=random_state
         )
 
-        scores = []
-        trial_selected_features_list = []
 
-        # --- TUNING --- #
-        for train_idx, val_idx in skf.split(X_train, y_train):
-            # Split the data for the current inner fold
+    def _build_model(self, trial):
+        """
+        Build a new model with the hyperparameters of the given trial,
+        including the ones that are fixed in the hyperparameter space. Works
+        both during the optimization and with the best trial of a study.
+        """
+        hyperparams = self.hyperparam_spaces[self.model_name](trial)
+        return VALID_MODELS[self.model_name].__class__(**hyperparams)
+
+
+    def _rank_features(self, X_scaled: pd.DataFrame, y: pd.Series):
+        """
+        Ordered list of the features selected by mrmr (best first), or all the
+        features if mrmr is not used. mrmr is greedy, so the first k features
+        of the list are the selection for any k up to n_features.
+        """
+        if not self.mrmr:
+            return X_scaled.columns.tolist()
+        return mrmr_classif(
+            X=X_scaled, y=y, K=self.n_features, show_progress=False
+        )
+        # TODO: possibly add more fs methods
+
+
+    def _prepare_inner_folds(
+            self,
+            X_train: pd.DataFrame,
+            y_train: pd.Series,
+            groups_train: pd.Series,
+            random_state: int
+        ):
+        """
+        Split, scale and run the feature selection for each inner fold. None
+        of these depend on the hyperparameters, so they are computed once per
+        outer fold and reused by all the Optuna trials.
+        """
+        cv = self._make_cv(self.n_inners, random_state)
+
+        inner_folds = []
+        for train_idx, val_idx in cv.split(X_train, y_train, groups_train):
             X_tr = X_train.iloc[train_idx]
             y_tr = y_train.iloc[train_idx]
             X_val = X_train.iloc[val_idx]
@@ -315,41 +340,59 @@ class NestedCV:
             )
 
             # Feature selection for the current inner fold
-            current_selected_features = X_tr_scaled.columns.tolist()
-            if self.mrmr:
-                current_selected_features = mrmr_classif(
-                    X=X_tr_scaled,
-                    y=y_tr,
-                    K=self.n_features,
-                    show_progress=False
-                )
-                X_tr_scaled = X_tr_scaled[current_selected_features]
-                X_val_scaled = X_val_scaled[current_selected_features]
-            # TODO: possibly add more fs methods
+            ranked_features = self._rank_features(X_tr_scaled, y_tr)
 
-            # Accumulate features selected in this inner fold
-            trial_selected_features_list.extend(current_selected_features)
+            inner_folds.append(
+                (X_tr_scaled, y_tr, X_val_scaled, y_val, ranked_features)
+            )
+
+        return inner_folds
+
+
+    def _objective(
+            self,
+            trial: optuna.Trial,
+            inner_folds: list
+        ):
+        """
+        Objective function for Optuna hyperparameter optimization.
+
+        Parameters
+        ----------
+        trial : optuna.Trial
+            The Optuna trial object.
+        inner_folds : list
+            The prepared inner folds (see _prepare_inner_folds).
+
+        Returns
+        -------
+        float
+            The mean score of the model based on the specified metric.
+        """
+        model = self._build_model(trial)
+
+        # The number of selected features is tuned like a hyperparameter
+        n_features_to_use = None
+        if self.mrmr:
+            n_features_to_use = trial.suggest_int(
+                "n_features_to_use", min(5, self.n_features), self.n_features
+            )
+
+        scores = []
+
+        # --- TUNING --- #
+        for X_tr_scaled, y_tr, X_val_scaled, y_val, ranked_features in inner_folds:
+            features = ranked_features[:n_features_to_use]
 
             # Fit the model and evaluate
-            model.fit(X_tr_scaled, y_tr)
+            model.fit(X_tr_scaled[features], y_tr)
 
             if hasattr(model, 'classes_') and isinstance(model.classes_, list):
                 model.classes_ = np.array(model.classes_)
 
-            y_pred = model.predict(X_val_scaled)
+            y_pred = model.predict(X_val_scaled[features])
             score = self.metric(y_val, y_pred)
             scores.append(score)
-
-            # Handle Optuna pruning
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
-
-        # After all inner folds for this trial, store the aggregated feature
-        # counts
-        trial.set_user_attr(
-            "selected_features_in_trial_counts",
-            Counter(trial_selected_features_list)
-        )
 
         return np.mean(scores)
 
@@ -361,10 +404,8 @@ class NestedCV:
         This method performs nested cross-validation, where the outer loop
         is used for model evaluation and the inner loop is used for
         hyperparameter tuning using Optuna.
-        It identifies the 'n_features_to_select' most commonly selected features
-        from the best Optuna trial's inner folds for the final model in the
-        outer loop. It also tracks feature selection counts for the best trial
-        in each outer fold and saves results and trained models.
+        The features of the final model of each outer fold are selected on the
+        whole outer training set. Results and trained models are saved.
         """
 
         # Ensure output directories exist
@@ -384,14 +425,10 @@ class NestedCV:
 
             # --- OUTER CROSS-VALIDATION LOOP --- #
 
-            outer_skf = StratifiedKFold(
-                n_splits=self.n_outers,
-                shuffle=True,
-                random_state=round_random_state
-            )
+            outer_skf = self._make_cv(self.n_outers, round_random_state)
 
             for outer_fold_idx, (outer_train_idx, outer_val_idx) in enumerate(
-                outer_skf.split(self.X, self.y)
+                outer_skf.split(self.X, self.y, self.groups)
             ):
                 if verbose:
                     print(
@@ -404,6 +441,10 @@ class NestedCV:
                 outer_y_train = self.y.iloc[outer_train_idx]
                 outer_X_val = self.X.iloc[outer_val_idx]
                 outer_y_val = self.y.iloc[outer_val_idx]
+                outer_groups_train = (
+                    self.groups.iloc[outer_train_idx]
+                    if self.groups is not None else None
+                )
 
                 # Scale the outer training and validation data
                 outer_scaler = StandardScaler()
@@ -429,56 +470,37 @@ class NestedCV:
                         f"_outer_fold_{outer_fold_idx}"
                     )
                 )
-                # The inner loop actually happens inside the _objective ;)
+                # The inner folds are prepared once and reused by all trials
+                inner_folds = self._prepare_inner_folds(
+                    outer_X_train,  # Will be scaled in there
+                    outer_y_train,
+                    outer_groups_train,
+                    round_random_state
+                )
+                # n_jobs=1: Optuna is only reproducible when run sequentially
                 study.optimize(
-                    lambda trial: self._objective(
-                        trial,
-                        outer_X_train,  # Will be scaled in there
-                        outer_y_train,
-                        round_random_state
-                    ),
+                    lambda trial: self._objective(trial, inner_folds),
                     n_trials=self.n_optuna_trials,
                     show_progress_bar=True,
-                    n_jobs=-1
+                    n_jobs=1
                 )
 
-                # Retrieve best parameters and the full feature selection counts
-                # from the best trial
+                # Retrieve best parameters from the best trial
                 best_params = study.best_params
-                feature_selection_counts_for_best_trial = study.best_trial.user_attrs.get(
-                    "selected_features_in_trial_counts", Counter()
-                )
 
 
                 # --- RESUME ON THE OUTER FOLD --- #
 
-                most_common_features_list = [
-                    feature for feature, _
-                    in feature_selection_counts_for_best_trial.most_common(
-                        self.n_features
+                # Feature selection on the whole outer training set
+                final_features_for_outer_fold = self._rank_features(
+                    outer_X_train_scaled, outer_y_train
+                )[:best_params.get("n_features_to_use")]
+                if verbose:
+                    print(
+                        f"[{time()}]"
+                        f"\tUsing {len(final_features_for_outer_fold)} "
+                        "features for final model."
                     )
-                ]
-
-                # If no feature selection method is specified or no
-                # features were selected by mRMR, use all features from
-                # the scaled dataset.
-                if not self.mrmr or not most_common_features_list:
-                    final_features_for_outer_fold = outer_X_train_scaled.columns.tolist()
-                    if verbose:
-                        print(
-                            f"[{time()}]"
-                            "\tNo feature selection or no features selected. "
-                            f"Using all {len(final_features_for_outer_fold)}"
-                            " features."
-                        )
-                else:
-                    final_features_for_outer_fold = most_common_features_list
-                    if verbose:
-                        print(
-                            f"[{time()}]"
-                            f"\tSelected top {len(final_features_for_outer_fold)} "
-                            "most common features for final model."
-                        )
 
                 # Subset the scaled outer training and validation sets with the
                 # final features
@@ -491,22 +513,42 @@ class NestedCV:
 
                 # Train the final model for this outer fold with the best
                 # hyperparameters
-                final_model = self.model.set_params(**best_params)
+                # (a new model, built the same way as during the tuning)
+                final_model = self._build_model(study.best_trial)
                 final_model.fit(outer_X_train_final, outer_y_train)
 
                 # Evaluate the final model on the outer validation set
                 outer_y_pred = final_model.predict(outer_X_val_final)
+                if hasattr(final_model, "predict_proba"):
+                    outer_y_score = final_model.predict_proba(
+                        outer_X_val_final
+                    )[:, 1]
+                else:
+                    outer_y_score = final_model.decision_function(
+                        outer_X_val_final
+                    )
                 outer_metrics = self._calculate_metrics(
-                    outer_y_val, outer_y_pred
+                    outer_y_val, outer_y_pred, outer_y_score
+                )
+
+                # Save the scaler, selected features and model of this fold
+                joblib.dump(
+                    {
+                        "scaler": outer_scaler,
+                        "features": final_features_for_outer_fold,
+                        "model": final_model
+                    },
+                    os.path.join(
+                        self.models_dir,
+                        f"{self.model_name}_round_{round_idx}"
+                        f"_outer_fold_{outer_fold_idx}.joblib"
+                    )
                 )
 
                 # Store Results for the Current Outer Fold
                 self.results[round_idx][outer_fold_idx] = {
                     "metrics": outer_metrics,
                     "hyperparams": best_params,
-                    "feature_selection_counts": dict(
-                        feature_selection_counts_for_best_trial
-                    ),
                     "features_used_for_final_model": final_features_for_outer_fold
                 }
                 if verbose:
@@ -522,8 +564,8 @@ class NestedCV:
 
         # After all rounds and folds are complete, save the entire results
         # dictionary
-        results_filename = f"{self.model_name}_nested_cv_results_{datetime.now(
-        ):%Y%m%d-%H%M%S}.json"
+        timestamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+        results_filename = f"{self.model_name}_nested_cv_results_{timestamp}.json"
         results_filepath = os.path.join(self.results_dir, results_filename)
         with open(results_filepath, "w") as f:
             serializable_results = convert_numpy_types(self.results)
@@ -541,12 +583,12 @@ class NestedCV:
         -------
         pd.DataFrame
             A DataFrame where each row represents an outer fold, containing its
-            metrics, hyperparameters, feature selection counts, and the
-            features used for the final model.
+            metrics, hyperparameters, and the features used for the final
+            model.
 
         collections.Counter
-            A Counter object summarizing the global feature selection
-            frequencies across all outer folds and their respective best trials.
+            A Counter object summarizing how many times each feature was used
+            in the final models across all outer folds.
         """
 
         if not self.results:
@@ -561,9 +603,6 @@ class NestedCV:
                     "outer_fold": outer_fold_idx,
                     **fold_data["metrics"],
                     "hyperparams": fold_data["hyperparams"],
-                    "feature_selection_counts": fold_data[
-                        "feature_selection_counts"
-                    ],
                     "features_used_for_final_model": fold_data[
                         "features_used_for_final_model"
                     ]
@@ -574,8 +613,8 @@ class NestedCV:
 
         # Calculate global feature selection frequencies
         global_feature_selection_counts = Counter()
-        for counts_dict in summary_df["feature_selection_counts"]:
-            global_feature_selection_counts.update(counts_dict)
+        for features in summary_df["features_used_for_final_model"]:
+            global_feature_selection_counts.update(features)
 
         print(f"\n--- Summary of Nested CV Results ({self.model_name}) ---")
         print(f"Primary Metric ({self.metric_name}):")
@@ -610,7 +649,8 @@ def complete_pipeline(
         optuna_direction: str = "maximize",
         mrmr: bool = True,
         n_features: int = 10,
-        random_state_base=42
+        random_state_base=42,
+        groups: pd.Series = None
     ):
     """
     Executes the complete nested cross-validation pipeline, including model
@@ -629,13 +669,13 @@ def complete_pipeline(
         Directory to save the trained models.
     results_dir : str
         Directory to save the results.
-    n_rounds : int, optional (default=2)
+    n_rounds : int, optional (default=5)
         Number of rounds for the nested cross-validation.
-    n_outers : int, optional (default=2)
+    n_outers : int, optional (default=5)
         Number of outer folds for the nested cross-validation.
-    n_inners : int, optional (default=2)
+    n_inners : int, optional (default=10)
         Number of inner folds for the nested cross-validation.
-    n_optuna_trials : int, optional (default=5)
+    n_optuna_trials : int, optional (default=50)
         Number of trials for hyperparameter optimization with Optuna.
     metric : str, optional (default="mcc")
         Metric to optimize during hyperparameter tuning. Must be one of the
@@ -645,9 +685,12 @@ def complete_pipeline(
     mrmr : bool, optional (default=True)
         Whether to use mrmr for feature selection.
     n_features : int, optional (default=10)
-        Number of features to select if mrmr is True.
+        Maximum number of features to select if mrmr is True.
     random_state_base : int, optional (default=42)
         Base random state for reproducibility.
+    groups : pd.Series, optional (default=None)
+        Group label of each sample (e.g. the gene), to keep the samples of a
+        group in the same fold.
     """
     # --- RUN NCV --- #
     print(f"[{time()}] Starting Nested CV for {model_name}...")
@@ -665,7 +708,8 @@ def complete_pipeline(
         optuna_direction=optuna_direction,
         mrmr=mrmr,
         n_features=n_features,
-        random_state_base=random_state_base
+        random_state_base=random_state_base,
+        groups=groups
     )
     nested_cv.run_nested_cv()
 
@@ -674,17 +718,14 @@ def complete_pipeline(
     summary_df, global_feature_counts = nested_cv.summarize_results()
 
     # Save summary results to CSV
-    summary_filename = f"{model_name}_summary_results_{datetime.now(
-    ):%Y%m%d-%H%M%S}.csv"
+    timestamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    summary_filename = f"{model_name}_summary_results_{timestamp}.csv"
     summary_filepath = os.path.join(results_dir, summary_filename)
 
     temp_summary_df = summary_df.copy()
 
     temp_summary_df["hyperparams"] = temp_summary_df[
         "hyperparams"
-    ].apply(convert_numpy_types).apply(json.dumps)
-    temp_summary_df["feature_selection_counts"] = temp_summary_df[
-        "feature_selection_counts"
     ].apply(convert_numpy_types).apply(json.dumps)
     temp_summary_df["features_used_for_final_model"] = temp_summary_df[
         "features_used_for_final_model"
