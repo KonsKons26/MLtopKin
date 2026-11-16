@@ -3,3 +3,4 @@ latex_files
 data_raw
 data
 src/__pycache__
+models/*_outer_fold_*.joblib

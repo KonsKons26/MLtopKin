@@ -204,7 +204,9 @@ class NestedCV:
                 ) if trial.params.get("kernel") == "poly" else 3,
                 "class_weight": trial.suggest_categorical(
                     "class_weight", ["balanced", None]
-                )
+                ),
+                # Large C values can take very long to converge
+                "max_iter": 100_000
             },
             "RandomForestClassifier": lambda trial: {
                 "n_estimators": trial.suggest_int("n_estimators", 100, 500),
